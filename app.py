@@ -107,6 +107,12 @@ def build_input_row(
         row["day_of_year"] = float(month * 30)
     if "is_winter" in row:
         row["is_winter"] = float(month in [12, 1, 2])
+    if "month_sin" in row:
+        row["month_sin"] = float(np.sin(2 * np.pi * month / 12))
+    if "month_cos" in row:
+        row["month_cos"] = float(np.cos(2 * np.pi * month / 12))
+    # termination_ratio cannot be derived from user inputs (requires premium data)
+    # — kept at training median, which is the correct fallback
     if "power_density" in row:
         row["power_density"] = engine_power / (engine_volume + 1e-5)
     if "bm_car_age" in row:
