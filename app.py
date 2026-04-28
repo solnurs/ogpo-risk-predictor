@@ -69,33 +69,41 @@ def build_input_row(
     region_id: int,
     vehicle_type: int,
     month: int,
+    termination_ratio: float,
     feat_medians: pd.Series,
 ) -> pd.DataFrame:
     """
     Build a single-row DataFrame in the same feature space as X_train.
     Start from medians, then override user-supplied fields and derived features.
+
+    IMPORTANT scale conversions:
+      - bonus_malus: OGPO standard 0.5-2.45 → training data stores as ×10 (5-24.5)
+      - engine_volume: user inputs Liters → training data stores in CC (×1000)
     """
     row = feat_medians.copy().to_dict()
 
-    # ── Direct feature overrides ──────────────────────────────────────────────
+    # ── Scale conversions ─────────────────────────────────────────────────────
     current_year = 2025  # dataset reference year
     car_age_binary = int((current_year - car_year) > 7)
+    bonus_malus_scaled = bonus_malus * 10.0   # OGPO 0.5-2.45 → training scale 5-24.5
+    engine_volume_cc   = engine_volume * 1000.0  # Liters → CC
 
     for key, val in {
-        "bonus_malus_mean":      bonus_malus,
-        "bonus_malus_max":       bonus_malus,
+        "bonus_malus_mean":      bonus_malus_scaled,
+        "bonus_malus_max":       bonus_malus_scaled,
         "bonus_malus_std":       0.0,
         "experience_year_mean":  experience_years,
         "experience_year_max":   experience_years,
         "experience_year_std":   0.0,
         "n_drivers":             float(n_drivers),
         "engine_power":          engine_power,
-        "engine_volume":         engine_volume,
+        "engine_volume":         engine_volume_cc,
         "car_year":              float(car_year),
         "region_id":             float(region_id),
         "vehicle_type_id":       float(vehicle_type),
         "month":                 float(month),
         "car_age_binary":        float(car_age_binary),
+        "termination_ratio":     termination_ratio,
     }.items():
         if key in row:
             row[key] = val
@@ -114,9 +122,9 @@ def build_input_row(
     # termination_ratio cannot be derived from user inputs (requires premium data)
     # — kept at training median, which is the correct fallback
     if "power_density" in row:
-        row["power_density"] = engine_power / (engine_volume + 1e-5)
+        row["power_density"] = engine_power / (engine_volume_cc + 1e-5)
     if "bm_car_age" in row:
-        row["bm_car_age"] = bonus_malus * car_age_binary
+        row["bm_car_age"] = bonus_malus_scaled * car_age_binary
     if "experience_sq" in row:
         row["experience_sq"] = experience_years ** 2
 
@@ -205,6 +213,12 @@ month = st.sidebar.slider(
     min_value=1, max_value=12, value=6,
 )
 
+termination_ratio = st.sidebar.slider(
+    "Termination ratio",
+    min_value=0.00, max_value=0.95, value=0.00, step=0.05,
+    help="Fraction of premium reduction from early termination. 0 = policy ran full term. Higher = partial cancellation.",
+)
+
 predict_btn = st.sidebar.button("Predict Risk", type="primary", use_container_width=True)
 
 # ─── UI: Main panel ─────────────────────────────────────────────────────────────
@@ -225,6 +239,7 @@ with st.spinner("Running model…"):
         bonus_malus, experience_years, n_drivers,
         engine_power, engine_volume, car_year,
         region_id, vehicle_type, month,
+        termination_ratio,
         feat_medians,
     )
     prob, shap_df = predict_and_explain(input_df)
@@ -321,19 +336,22 @@ with st.expander("Full SHAP feature table"):
 # ─── Input summary (expandable) ─────────────────────────────────────────────────
 with st.expander("Input summary"):
     st.json({
-        "bonus_malus":        bonus_malus,
-        "experience_years":   experience_years,
-        "n_drivers":          n_drivers,
-        "engine_power_hp":    engine_power,
-        "engine_volume_L":    engine_volume,
-        "car_year":           car_year,
-        "region":             region_label,
-        "vehicle_type":       vehicle_type_label,
-        "month":              month,
-        "car_age_binary":     int((2025 - car_year) > 7),
-        "power_density":      round(engine_power / (engine_volume + 1e-5), 2),
-        "bm_car_age":         round(bonus_malus * int((2025 - car_year) > 7), 3),
-        "experience_sq":      round(experience_years ** 2, 1),
+        "bonus_malus_ogpo":        bonus_malus,
+        "bonus_malus_model_scale": round(bonus_malus * 10.0, 2),
+        "experience_years":        experience_years,
+        "n_drivers":               n_drivers,
+        "engine_power_hp":         engine_power,
+        "engine_volume_L":         engine_volume,
+        "engine_volume_cc":        int(engine_volume * 1000),
+        "car_year":                car_year,
+        "region":                  region_label,
+        "vehicle_type":            vehicle_type_label,
+        "month":                   month,
+        "termination_ratio":       termination_ratio,
+        "car_age_binary":          int((2025 - car_year) > 7),
+        "power_density":           round(engine_power / (engine_volume * 1000 + 1e-5), 4),
+        "bm_car_age":              round(bonus_malus * 10.0 * int((2025 - car_year) > 7), 3),
+        "experience_sq":           round(experience_years ** 2, 1),
     })
 
 st.caption(
