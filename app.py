@@ -77,7 +77,9 @@ def build_input_row(
     Start from medians, then override user-supplied fields and derived features.
 
     IMPORTANT scale conversions:
-      - bonus_malus: OGPO standard 0.5-2.45 → training data stores as ×10 (5-24.5)
+      - bonus_malus: OGPO coefficient 0.50-2.45 → training data stores INTEGER CLASS 0-13
+        where class 0 = coef 2.45 (most malus/risky), class 13 = coef 0.50 (most bonus/safest)
+        Formula: class = round((2.45 - ogpo_coef) * 13 / 1.95)
       - engine_volume: user inputs Liters → training data stores in CC (×1000)
     """
     row = feat_medians.copy().to_dict()
@@ -85,12 +87,14 @@ def build_input_row(
     # ── Scale conversions ─────────────────────────────────────────────────────
     current_year = 2025  # dataset reference year
     car_age_binary = int((current_year - car_year) > 7)
-    bonus_malus_scaled = bonus_malus * 10.0   # OGPO 0.5-2.45 → training scale 5-24.5
-    engine_volume_cc   = engine_volume * 1000.0  # Liters → CC
+    # BM: OGPO coefficient → integer class 0-13 (0=riskiest, 13=safest)
+    bm_class = int(round((2.45 - bonus_malus) * 13.0 / 1.95))
+    bm_class = max(0, min(13, bm_class))
+    engine_volume_cc = engine_volume * 1000.0  # Liters → CC
 
     for key, val in {
-        "bonus_malus_mean":      bonus_malus_scaled,
-        "bonus_malus_max":       bonus_malus_scaled,
+        "bonus_malus_mean":      float(bm_class),
+        "bonus_malus_max":       float(bm_class),
         "bonus_malus_std":       0.0,
         "experience_year_mean":  experience_years,
         "experience_year_max":   experience_years,
@@ -124,7 +128,7 @@ def build_input_row(
     if "power_density" in row:
         row["power_density"] = engine_power / (engine_volume_cc + 1e-5)
     if "bm_car_age" in row:
-        row["bm_car_age"] = bonus_malus_scaled * car_age_binary
+        row["bm_car_age"] = float(bm_class) * car_age_binary
     if "experience_sq" in row:
         row["experience_sq"] = experience_years ** 2
 
@@ -163,11 +167,31 @@ def predict_and_explain(input_df: pd.DataFrame):
 st.sidebar.title("Policy Inputs")
 st.sidebar.markdown("Enter the policy details below:")
 
-bonus_malus = st.sidebar.slider(
+# 14 discrete OGPO BM classes: class 0=coef 2.45 (worst) → class 13=coef 0.50 (safest)
+_BM_OPTIONS = {
+    "0.50  (K10 — max discount, safest)": 0.50,
+    "0.65  (K9)": 0.65,
+    "0.80  (K8)": 0.80,
+    "0.95  (K7 — slight discount)": 0.95,
+    "1.10  (K0 — neutral)": 1.10,
+    "1.25  (M1 — slight surcharge)": 1.25,
+    "1.40  (M1+)": 1.40,
+    "1.55  (M2)": 1.55,
+    "1.70  (M2+)": 1.70,
+    "1.85  (M3)": 1.85,
+    "2.00  (M3+)": 2.00,
+    "2.15  (M3++)": 2.15,
+    "2.30  (M3+++)": 2.30,
+    "2.45  (M3 max — highest surcharge, riskiest)": 2.45,
+}
+_bm_keys = list(_BM_OPTIONS.keys())
+bm_label = st.sidebar.selectbox(
     "Bonus-Malus coefficient",
-    min_value=0.50, max_value=2.45, value=1.00, step=0.05,
-    help="1.0 = clean history. >1.0 = prior at-fault claims.",
+    options=_bm_keys,
+    index=3,   # default: K7 = 0.95 (≈ training median class 10)
+    help="OGPO classes: K = bonus (discount, safe driver). M = malus (surcharge, at-fault history). K10=0.50 is the safest.",
 )
+bonus_malus = _BM_OPTIONS[bm_label]
 
 experience_years = st.sidebar.slider(
     "Driving experience (years)",
@@ -214,9 +238,10 @@ month = st.sidebar.slider(
 )
 
 termination_ratio = st.sidebar.slider(
-    "Termination ratio",
+    "Early termination ratio",
     min_value=0.00, max_value=0.95, value=0.00, step=0.05,
-    help="Fraction of premium reduction from early termination. 0 = policy ran full term. Higher = partial cancellation.",
+    help="0 = policy ran its full term (most common). >0 = policy was cancelled early and partial premium was refunded. "
+         "Note: the model associates full-term policies (0) with higher claim likelihood — early termination often means the driver switched insurer without a claim.",
 )
 
 predict_btn = st.sidebar.button("Predict Risk", type="primary", use_container_width=True)
@@ -246,12 +271,13 @@ with st.spinner("Running model…"):
 
 prob_pct = prob * 100
 
-# Risk category thresholds
-if prob_pct < 3.0:
+# Risk category thresholds (calibrated for class_weight='balanced' model output range 7-71%)
+# LOW < 30%  |  MEDIUM 30-55%  |  HIGH > 55%
+if prob_pct < 30.0:
     risk_label  = "LOW"
     risk_color  = "green"
     bar_color   = "#28a745"
-elif prob_pct < 8.0:
+elif prob_pct < 55.0:
     risk_label  = "MEDIUM"
     risk_color  = "orange"
     bar_color   = "#fd7e14"
@@ -277,10 +303,10 @@ with col2:
 
 with col3:
     # Gauge bar
-    st.markdown("**Risk gauge (0% – 15%+)**")
-    gauge_pct = min(prob_pct / 15.0, 1.0)
+    st.markdown("**Risk gauge (0% – 70%+)**")
+    gauge_pct = min(prob_pct / 70.0, 1.0)
     st.progress(gauge_pct)
-    st.caption(f"{prob_pct:.2f}% (threshold: 3% / 8%)")
+    st.caption(f"{prob_pct:.2f}% (threshold: 30% LOW / 55% HIGH)")
 
 st.divider()
 
@@ -336,8 +362,8 @@ with st.expander("Full SHAP feature table"):
 # ─── Input summary (expandable) ─────────────────────────────────────────────────
 with st.expander("Input summary"):
     st.json({
-        "bonus_malus_ogpo":        bonus_malus,
-        "bonus_malus_model_scale": round(bonus_malus * 10.0, 2),
+        "bonus_malus_ogpo_coef":   bonus_malus,
+        "bonus_malus_class":       int(round((2.45 - bonus_malus) * 13.0 / 1.95)),
         "experience_years":        experience_years,
         "n_drivers":               n_drivers,
         "engine_power_hp":         engine_power,
@@ -350,7 +376,7 @@ with st.expander("Input summary"):
         "termination_ratio":       termination_ratio,
         "car_age_binary":          int((2025 - car_year) > 7),
         "power_density":           round(engine_power / (engine_volume * 1000 + 1e-5), 4),
-        "bm_car_age":              round(bonus_malus * 10.0 * int((2025 - car_year) > 7), 3),
+        "bm_car_age":              round(int(round((2.45 - bonus_malus) * 13.0 / 1.95)) * int((2025 - car_year) > 7), 3),
         "experience_sq":           round(experience_years ** 2, 1),
     })
 
